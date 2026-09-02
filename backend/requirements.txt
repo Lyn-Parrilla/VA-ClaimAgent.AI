@@ -1,4 +1,8 @@
 fastapi
 uvicorn[standard]
-pydantic
+pydantic>=2.0.0
+python-dotenv
 anthropic
+presidio-analyzer
+presidio-anonymizer
+spacy>=3.7.0,<3.8.0
