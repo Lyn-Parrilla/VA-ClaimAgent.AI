@@ -11,6 +11,8 @@ from google.cloud import dlp_v2
 from langsmith import traceable
 from pydantic import BaseModel, Field
 
+from .jobs_api import register_jobs_api
+
 # The backend root still holds .env and gcp-service-account.json, three levels up
 # from this module under the src layout (backend/src/claim_backend/main.py).
 BACKEND_ROOT = os.path.abspath(
@@ -88,6 +90,10 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+# Analysis job API. Self-contained router over the in-memory job store; it is
+# not yet connected to the extraction pipeline below.
+register_jobs_api(app)
 
 MODEL_NAME = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5@20260630")
 
