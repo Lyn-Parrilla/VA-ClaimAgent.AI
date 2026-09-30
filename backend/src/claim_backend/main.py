@@ -1,16 +1,26 @@
 import json
 import os
 import re
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Dict, List, Optional
 
 from anthropic import AnthropicVertex
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import dlp_v2
 from langsmith import traceable
 from pydantic import BaseModel, Field
 
+from .document_processing import (
+    DLP_BUILTIN_INFO_TYPES,
+    DLP_CUSTOM_INFO_TYPES,
+    DLP_INFO_TYPE_TO_ENTITY,
+    PiiFinding,
+    _get_dlp_client,
+)
+from .document_processing import detect_pii as _detect_pii
+from .document_processing import rehydrate_mapping_structure as _rehydrate_json
+from .document_processing import rehydrate_mapping_text as _rehydrate_text
+from .document_processing import tokenize_pii as _tokenize_pii
 from .jobs_api import register_jobs_api
 
 # The backend root still holds .env and gcp-service-account.json, three levels up
@@ -98,16 +108,11 @@ register_jobs_api(app)
 MODEL_NAME = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5@20260630")
 
 # Clients are created lazily so importing this module never performs network or
-# credential I/O, which keeps startup and tests fast.
-_dlp_client: Optional[dlp_v2.DlpServiceClient] = None
+# credential I/O, which keeps startup and tests fast. The DLP client accessor
+# now lives in document_processing and is imported above; it is re-bound in
+# this module's namespace so `detect_pii` below resolves it here, which keeps
+# the existing monkeypatch seam working.
 _anthropic_client: Optional[AnthropicVertex] = None
-
-
-def _get_dlp_client() -> dlp_v2.DlpServiceClient:
-    global _dlp_client
-    if _dlp_client is None:
-        _dlp_client = dlp_v2.DlpServiceClient()
-    return _dlp_client
 
 
 def _get_anthropic_client() -> AnthropicVertex:
@@ -121,53 +126,9 @@ def _get_anthropic_client() -> AnthropicVertex:
 
 DLP_PARENT = f"projects/{GOOGLE_CLOUD_PROJECT}/locations/global"
 
-# Built-in DLP info types. DATE and generic numeric types are deliberately
-# omitted so VA effective dates and diagnostic codes survive untouched.
-DLP_BUILTIN_INFO_TYPES = [
-    "PERSON_NAME",
-    "US_SOCIAL_SECURITY_NUMBER",
-    "PHONE_NUMBER",
-    "EMAIL_ADDRESS",
-    "STREET_ADDRESS",
-    "LOCATION",
-]
-
-# Custom regex info types cover the edge cases the built-in detectors miss:
-# dashless 9-digit SSNs and 7-digit local numbers without an area code.
-DLP_CUSTOM_INFO_TYPES = [
-    dlp_v2.CustomInfoType(
-        info_type=dlp_v2.InfoType(name="CUSTOM_SSN"),
-        regex=dlp_v2.CustomInfoType.Regex(pattern=r"\b\d{3}-?\d{2}-?\d{4}\b"),
-        likelihood=dlp_v2.Likelihood.VERY_LIKELY,
-    ),
-    dlp_v2.CustomInfoType(
-        info_type=dlp_v2.InfoType(name="CUSTOM_LOCAL_PHONE"),
-        regex=dlp_v2.CustomInfoType.Regex(
-            pattern=r"\b(?:\d{3}[-.\s]?)?\d{3}[-.\s]?\d{4}\b"
-        ),
-        likelihood=dlp_v2.Likelihood.LIKELY,
-    ),
-]
-
-# Map DLP info type names onto the stable token prefixes used in the entity map.
-DLP_INFO_TYPE_TO_ENTITY = {
-    "PERSON_NAME": "PERSON",
-    "US_SOCIAL_SECURITY_NUMBER": "SSN",
-    "CUSTOM_SSN": "SSN",
-    "PHONE_NUMBER": "PHONE_NUMBER",
-    "CUSTOM_LOCAL_PHONE": "PHONE_NUMBER",
-    "EMAIL_ADDRESS": "EMAIL_ADDRESS",
-    "STREET_ADDRESS": "LOCATION",
-    "LOCATION": "LOCATION",
-}
-
-
-class PiiFinding(NamedTuple):
-    """A single PII span detected by Cloud DLP, in codepoint offsets."""
-
-    entity_type: str
-    start: int
-    end: int
+# DLP_BUILTIN_INFO_TYPES, DLP_CUSTOM_INFO_TYPES, and DLP_INFO_TYPE_TO_ENTITY
+# now live in document_processing (imported above) so a single DLP
+# configuration serves both this pipeline and the protection boundary.
 
 
 class ExtractRequest(BaseModel):
@@ -195,33 +156,12 @@ def detect_pii(text: str) -> List[PiiFinding]:
     """Inspect text with Cloud DLP and return the PII spans to tokenize.
 
     Intentionally not traced by LangSmith: the input here still contains raw PII.
-    """
-    response = _get_dlp_client().inspect_content(
-        request={
-            "parent": DLP_PARENT,
-            "inspect_config": {
-                "info_types": [{"name": name} for name in DLP_BUILTIN_INFO_TYPES],
-                "custom_info_types": DLP_CUSTOM_INFO_TYPES,
-                "min_likelihood": dlp_v2.Likelihood.POSSIBLE,
-                "include_quote": False,
-                "limits": {"max_findings_per_request": 0},
-            },
-            "item": {"value": text},
-        }
-    )
 
-    findings: List[PiiFinding] = []
-    for finding in response.result.findings:
-        entity_type = DLP_INFO_TYPE_TO_ENTITY.get(finding.info_type.name)
-        if not entity_type:
-            continue
-        span = finding.location.codepoint_range
-        if span.end <= span.start:
-            continue
-        findings.append(
-            PiiFinding(entity_type=entity_type, start=span.start, end=span.end)
-        )
-    return findings
+    The implementation lives in document_processing; this wrapper supplies the
+    client and resource parent. Resolving ``_get_dlp_client`` from this
+    module's namespace keeps the established test seam intact.
+    """
+    return _detect_pii(text, client=_get_dlp_client(), parent=DLP_PARENT)
 
 
 def _strip_markdown_json(raw: str) -> str:
@@ -233,58 +173,10 @@ def _strip_markdown_json(raw: str) -> str:
     return text.strip()
 
 
-def _tokenize_pii(
-    text: str, findings: List[PiiFinding]
-) -> tuple[str, Dict[str, str]]:
-    """Replace detected PII with safe tokens and return the tokenized text + map.
-
-    The map is token -> original value, kept in request-local memory only.
-    """
-    pii_map: Dict[str, str] = {}
-    type_counts: Dict[str, int] = {}
-    # Walk backward through the text so earlier indices stay valid, preferring the
-    # longest span whenever two findings start at the same offset.
-    sorted_findings = sorted(
-        findings, key=lambda f: (f.start, f.end - f.start), reverse=True
-    )
-    tokenized = text
-    last_start = len(text)
-
-    for finding in sorted_findings:
-        if finding.end > last_start:
-            # Skip findings that overlap a span we already tokenized.
-            continue
-        original = text[finding.start : finding.end]
-        entity_type = finding.entity_type
-        type_counts[entity_type] = type_counts.get(entity_type, 0) + 1
-        token = f"<{entity_type}_{type_counts[entity_type]}>"
-        pii_map[token] = original
-        tokenized = tokenized[: finding.start] + token + tokenized[finding.end :]
-        last_start = finding.start
-
-    return tokenized, pii_map
-
-
-def _rehydrate_text(text: str, entity_map: Dict[str, str]) -> str:
-    """Replace safe tokens with original PII values, longest tokens first."""
-    result = text
-    for token in sorted(entity_map.keys(), key=len, reverse=True):
-        result = result.replace(token, entity_map[token])
-    return result
-
-
-def _rehydrate_json(obj: Any, entity_map: Dict[str, str]) -> Any:
-    """Recursively replace safe tokens in parsed JSON with the original PII values."""
-    if isinstance(obj, dict):
-        return {k: _rehydrate_json(v, entity_map) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_rehydrate_json(item, entity_map) for item in obj]
-    if isinstance(obj, str):
-        result = obj
-        for token in sorted(entity_map.keys(), key=len, reverse=True):
-            result = result.replace(token, entity_map[token])
-        return result
-    return obj
+# _tokenize_pii, _rehydrate_text, and _rehydrate_json are imported from
+# document_processing at the top of this module. Their behavior is unchanged;
+# they were moved so a single implementation backs both this pipeline and the
+# protection boundary.
 
 
 @traceable(name="extract_va_claims")
